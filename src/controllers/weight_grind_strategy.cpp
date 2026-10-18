@@ -126,7 +126,13 @@ void WeightGrindStrategy::run_pulse_decision_phase(GrindController& controller,
 
     float settled_weight;
     if (!controller.weight_sensor->check_settling_complete(GRIND_SCALE_PRECISION_SETTLING_TIME_MS, &settled_weight)) {
-        return;
+        // Do not stall until the grind timeout on a scale that never meets the precision
+        // threshold; decide on the best available reading instead.
+        if (loop_data.now - controller.phase_start_time < GRIND_SCALE_SETTLING_TIMEOUT_MS) {
+            return;
+        }
+        settled_weight = controller.weight_sensor->get_weight_high_latency();
+        controller.queue_log_message("[PULSE_DECISION] Settling timeout, using %.2fg\n", settled_weight);
     }
 
     float conservative_target = controller.target_weight - GRIND_ACCURACY_TOLERANCE_G;

@@ -241,7 +241,14 @@ void GrindController::return_to_idle() {
     ControlLock lock(control_mutex_);
     // This is called by the UI to acknowledge a completed or timed-out grind
     // and return the controller to the IDLE state.
-    if (phase == GrindPhase::COMPLETED || phase == GrindPhase::TIMEOUT) {
+    // The completion screen stays visible while a time-mode additional pulse runs and its
+    // result is re-measured, so the acknowledgement must also end that phase; otherwise the
+    // OK button, auto-return timer and cup-removal return would be silently ignored.
+    if (phase == GrindPhase::TIME_ADDITIONAL_PULSE && grinder) {
+        grinder->stop();
+    }
+    if (phase == GrindPhase::COMPLETED || phase == GrindPhase::TIMEOUT ||
+        phase == GrindPhase::TIME_ADDITIONAL_PULSE) {
         LOG_BLE("[%lums CONTROLLER] UI acknowledged completion/timeout, returning to IDLE.\n", millis());
         time_grind_start_ms = 0;
         target_time_ms = 0;
@@ -365,22 +372,27 @@ void GrindController::update() {
             break;
         }
             
-        case GrindPhase::TARING:
-            if (weight_sensor->start_nonblocking_tare()) {
+        case GrindPhase::TARING: {
+            // Only capture the zero point once the scale is quiet (cup placed, button press
+            // vibrations gone). Fall back after the tare timeout so a noisy scale still tares.
+            bool scale_quiet = weight_sensor->is_settled();
+            bool wait_timed_out = (loop_data.now - phase_start_time) >= GRIND_TARE_TIMEOUT_MS;
+            if ((scale_quiet || wait_timed_out) && weight_sensor->start_nonblocking_tare()) {
                 LOG_LOADCELL_DEBUG("Non-blocking tare started\n");
                 switch_phase(GrindPhase::TARE_CONFIRM, loop_data);
             }
             break;
+        }
             
         case GrindPhase::TARE_CONFIRM:
             // Check if tare is complete
             if (!weight_sensor->is_tare_in_progress()) {
                 // The tare offset was just sampled; it is only trustworthy if the scale was
-                // settled while it was taken. Otherwise re-tare instead of grinding against
-                // a zero point captured mid-disturbance (e.g. cup still wobbling).
+                // settled while it was taken. Otherwise wait for the scale to calm down and
+                // re-tare instead of grinding against a zero point captured mid-disturbance.
                 if (!weight_sensor->is_settled()) {
-                    LOG_LOADCELL_DEBUG("Tare captured while unsettled - re-taring\n");
-                    weight_sensor->start_nonblocking_tare();
+                    LOG_LOADCELL_DEBUG("Tare captured while unsettled - re-taring once settled\n");
+                    switch_phase(GrindPhase::TARING, loop_data);
                 } else {
                     if (!grinder->is_grinding()) {
                         grinder->start();  // Ensure motor is running
@@ -494,12 +506,20 @@ void GrindController::update() {
             }
             break;
 
-        case GrindPhase::FINAL_SETTLING:
-            // Wait for weight to settle with precision settling window
-            if (weight_sensor->check_settling_complete(GRIND_SCALE_PRECISION_SETTLING_TIME_MS)) {
+        case GrindPhase::FINAL_SETTLING: {
+            // Wait for weight to settle with precision settling window. The motor is already
+            // off, so a scale that never meets the precision threshold (ambient vibration)
+            // must still produce a result instead of running into the grind timeout.
+            bool settled = weight_sensor->check_settling_complete(GRIND_SCALE_PRECISION_SETTLING_TIME_MS);
+            bool settling_timed_out = (loop_data.now - phase_start_time) >= GRIND_SCALE_SETTLING_TIMEOUT_MS;
+            if (settled || settling_timed_out) {
+                if (settling_timed_out && !settled) {
+                    queue_log_message("[FINAL] Settling timeout, using best available weight\n");
+                }
                 final_measurement(loop_data);
             }
             break;
+        }
             
         case GrindPhase::TIME_ADDITIONAL_PULSE: {
             // Wait for the pulse to finish, give the grounds time to land and the scale to

@@ -721,8 +721,9 @@ bool WeightSensor::sample_and_feed_filter() {
                 if (tareTimes < DATA_SET) {
                     tareTimes++;
                 } else {
-                    // Use CircularBufferMath smoothed data instead of original smoothedData()
-                    int32_t smoothed_raw = raw_filter.get_smoothed_raw(250); // 250ms window for stability
+                    // Average the tare window (the same span TARE_CONFIRM checks for settling);
+                    // at 10 SPS a shorter window would only cover 2-3 samples.
+                    int32_t smoothed_raw = raw_filter.get_smoothed_raw(GRIND_TARE_SAMPLE_WINDOW_MS);
                     tare_offset = smoothed_raw;  // Set tare offset to smoothed raw ADC value
                     tareTimes = 0;
                     doTare = 0;
