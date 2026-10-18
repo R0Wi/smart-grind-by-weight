@@ -146,7 +146,7 @@ If you want to try a less aggressive approach first:
 
 ## Grind Timeout Screen
 
-**Applies to:** Grinder timing out during operation, showing timeout screen after 30 seconds.
+**Applies to:** Grinder timing out during operation, showing timeout screen after 60 seconds.
 
 ### Symptoms
 - Grinder reaches timeout screen during grinding cycle
@@ -154,7 +154,7 @@ If you want to try a less aggressive approach first:
 - Unstable weight readings
 
 ### Root Cause
-Extended taring due to load cell noise prevents grinding from completing within 30-second limit.
+Extended taring due to load cell noise prevents grinding from completing within 60-second limit.
 
 ### Diagnosis
 Check **Menu → Diagnostics → "Noise Floor"** section (see [Diagnostics System](DOC.md#diagnostics-system) for details). If "Noise level: Too High" (red text) appears persistently, your load cell has sustained noise issues that will cause slow taring (>2 seconds). A warning icon (⚠) will appear in the top-right corner when sustained noise is detected.

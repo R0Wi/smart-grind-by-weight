@@ -61,8 +61,8 @@ int32_t CircularBufferMath::get_smoothed_raw(uint32_t window_ms) const {
     int32_t* samples = (int32_t*)alloca(max_samples * sizeof(int32_t));
     
     // Get samples within time window
-    int actual_samples = get_samples_in_window(window_ms, samples);
-    
+    int actual_samples = get_samples_in_window(window_ms, samples, max_samples);
+
     if (actual_samples == 0) {
         return get_latest_sample(); // Fallback to latest sample
     }
@@ -71,15 +71,15 @@ int32_t CircularBufferMath::get_smoothed_raw(uint32_t window_ms) const {
     return apply_outlier_rejection(samples, actual_samples);
 }
 
-int CircularBufferMath::get_samples_in_window(uint32_t window_ms, int32_t* samples_out) const {
-    if (samples_count == 0) return 0;
+int CircularBufferMath::get_samples_in_window(uint32_t window_ms, int32_t* samples_out, int max_samples) const {
+    if (samples_count == 0 || max_samples <= 0) return 0;
     
     uint32_t current_time = millis();
     uint32_t window_start = current_time - window_ms;
     int collected_samples = 0;
     
-    // Walk backwards from most recent sample
-    for (int i = 0; i < samples_count; i++) {
+    // Walk backwards from most recent sample (never write past the caller's buffer)
+    for (int i = 0; i < samples_count && collected_samples < max_samples; i++) {
         uint16_t index = (write_index - 1 - i + MAX_BUFFER_SIZE) % MAX_BUFFER_SIZE;
         
         // Check if sample is within time window
@@ -266,7 +266,7 @@ bool CircularBufferMath::is_settled(uint32_t window_ms, int32_t threshold_raw_un
         int max_samples = calculate_max_samples_for_window(window_ms);
         if (max_samples > 0) {
             int32_t* samples = (int32_t*)alloca(max_samples * sizeof(int32_t));
-            int actual_samples = get_samples_in_window(window_ms, samples);
+            int actual_samples = get_samples_in_window(window_ms, samples, max_samples);
             
             // Format raw samples on one line (limit to first 10 samples to avoid spam)
             char sample_str[256] = {0};
@@ -311,7 +311,7 @@ float CircularBufferMath::get_standard_deviation_raw(uint32_t window_ms) const {
     int32_t* samples = (int32_t*)alloca(max_samples * sizeof(int32_t));
     
     // Get samples within time window
-    int actual_samples = get_samples_in_window(window_ms, samples);
+    int actual_samples = get_samples_in_window(window_ms, samples, max_samples);
     
     return calculate_standard_deviation(samples, actual_samples);
 }
@@ -480,7 +480,7 @@ int32_t CircularBufferMath::get_min_raw(uint32_t window_ms) const {
     if (max_samples == 0) return 0;
     
     int32_t* samples = (int32_t*)alloca(max_samples * sizeof(int32_t));
-    int actual_samples = get_samples_in_window(window_ms, samples);
+    int actual_samples = get_samples_in_window(window_ms, samples, max_samples);
     
     if (actual_samples == 0) return 0;
     
@@ -498,7 +498,7 @@ int32_t CircularBufferMath::get_max_raw(uint32_t window_ms) const {
     if (max_samples == 0) return 0;
     
     int32_t* samples = (int32_t*)alloca(max_samples * sizeof(int32_t));
-    int actual_samples = get_samples_in_window(window_ms, samples);
+    int actual_samples = get_samples_in_window(window_ms, samples, max_samples);
     
     if (actual_samples == 0) return 0;
     

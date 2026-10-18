@@ -318,7 +318,7 @@ Access **Menu → Grind Settings** to configure:
 - **Purging** *(Advanced)*: Control how the grinder saturates itself before weight-mode grinding
   - **Prime mode**: Keeps the coffee used to saturate the grinder, continues immediately
   - **Purge mode** (default): Prompts you to discard stale grinds before continuing
-  - **Amount slider**: Configure purge/prime amount (0.1g-5.0g, default 1.0g). Amount is a minimum target; actual output will be slightly higher.
+  - **Amount slider**: Configure purge/prime amount (0.1g-2.5g, default 1.0g). Amount is a minimum target; actual output will be slightly higher.
   - **"Keep purge grinds from now on" checkbox**: Appears during purge confirmation - switches to Prime mode when checked
 
   *Explanation:* The time between motor start and grinds hitting the cup (grind latency) is used to predict the coast time (how long grinds will keep coming after the motor is disengaged). Purging clears stale coffee and saturates the grinder with fresh grounds, ensuring accurate latency detection. If you prefer to keep all coffee without manual intervention, select Prime mode.
@@ -391,7 +391,7 @@ Main Screen (swipe left/right between tabs, up/down to toggle weight/time mode i
     |       |-- Start on Cup toggle (start when ≈50 g arrives within ~2 s)
     |       |-- Return on Removal toggle (drop back to Ready when that weight leaves)
     |       |-- Purging (Prime/Purge radio buttons)
-    |       \-- Amount slider (0.1g-5.0g for purge/prime operation)
+    |       \-- Amount slider (0.1g-2.5g for purge/prime operation)
     |
     \-- Info
         +-- Diagnostics
@@ -534,13 +534,13 @@ The system uses a **zero-shot learning algorithm** requiring no prior knowledge 
 **Multi-Phase Approach:**
 
 1. **Initialization & Taring Phase**
-   - Automatic tare on grind button press
-   - 30-second timeout from grind start to completion
-   - Noise-adaptive settling detection
+   - Automatic tare on grind button press once the scale is settled (re-tares automatically if the scale was disturbed while the zero point was captured)
+   - 60-second timeout from grind start to completion
+   - Noise-adaptive settling detection; final and pulse-decision measurements fall back to the best available reading after a 10s settling timeout so a noisy scale still completes
 
 2. **Grinder Saturation Phase** (Weight mode only)
    - Saturates the grinder before main grind for accurate latency detection
-   - Configurable amount: 0.1g-5.0g (default 1.0g)
+   - Configurable amount: 0.1g-2.5g (default 1.0g)
    - **Prime mode**: Keeps coffee, continues immediately after settling
    - **Purge mode**: Shows confirmation popup, waits for user to discard stale grinds
    - Logging and chart updates disabled during purge confirmation
@@ -561,6 +561,7 @@ The system uses a **zero-shot learning algorithm** requiring no prior knowledge 
 5. **Time Mode Additional Pulses**
    - Dedicated `TIME_ADDITIONAL_PULSE` phase for post-completion grinding
    - 100ms fixed pulse duration
+   - After each pulse the scale is allowed to collect and settle before the displayed final weight is refreshed
    - Split-button UI: OK + PULSE buttons on completion screen
 
 **Motor Response Latency Model:**
@@ -577,7 +578,7 @@ The latency value is automatically calibrated via **Auto-Tune Motor Response** (
 - Hardware-adaptive pulse control via runtime motor latency
 - Conservative approach: undershoots target, then corrects with bounded pulses
 - Mechanical instability detection with hysteresis and persistence
-- 30-second grind timeout protection with user acknowledgment requirement
+- 60-second grind timeout protection with user acknowledgment requirement
 
 ---
 
