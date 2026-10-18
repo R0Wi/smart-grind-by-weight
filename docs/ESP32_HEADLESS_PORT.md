@@ -29,6 +29,16 @@ The original ESP32 is dual-core (240 MHz Xtensa LX6), so the existing Core 0 (sa
 5. **Optional hardware inputs**: one button (start/stop) and/or a status LED. The existing *Start on Cup* automation already allows touch-free operation.
 6. **Persist** the new settings through the existing `Preferences` keys (`grind_mode`, `chute_mode`, `chute_amount_g`, target weight/time); no storage changes needed.
 
+## Mobile App: Web Bluetooth SPA
+
+A static single-page app using the [Web Bluetooth API](https://developer.mozilla.org/docs/Web/API/Web_Bluetooth_API) can talk to the ESP32 directly over the BLE control/notify characteristics above. No backend, no app store.
+
+- **Hosting**: any static HTTPS host (e.g. GitHub Pages) — Web Bluetooth requires a secure context. Add a manifest + service worker to make it an installable, offline-capable PWA.
+- **UI**: target grams, mode, start/stop, tare, live weight and state, calibration wizard, warnings from diagnostics. Plain TypeScript or a light framework (Svelte/Preact) is plenty.
+- **Platform support**: Chrome/Edge on Android, Windows, macOS, Linux and ChromeOS work out of the box. **iOS Safari does not support Web Bluetooth**; use a Web Bluetooth-capable browser such as Bluefy, or wrap the same SPA with [Capacitor](https://capacitorjs.com/) + `@capacitor-community/bluetooth-le` for a native iOS/Android build.
+- **Protocol hygiene**: reuse the existing service-UUID layout, keep payloads small (JSON or a packed struct) and notification rate modest (~10 Hz matches the HX711), and version the protocol via a characteristic so the SPA can detect firmware mismatches.
+- **Bonus**: the existing OTA characteristics could later allow firmware updates from the same app.
+
 ## Memory
 
 - The grind logger allocates its staging buffers with `MALLOC_CAP_SPIRAM` (`grind_logging.cpp`). Without PSRAM that allocation fails → fall back to `MALLOC_CAP_8BIT`.
