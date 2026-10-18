@@ -1,80 +1,124 @@
-# Running on a Regular ESP32 (Headless)
+# Running on a Regular ESP32 (Headless, BLE-only)
 
-**Short answer: yes.** The control core (HX711, grind state machine, predictive flow, pulse correction, diagnostics, BLE, preferences, logging) is plain Arduino/FreeRTOS code and has no hard S3 dependency. Only the display/touch/LVGL layer is board-specific, and a headless build simply drops it.
+**Scope:** classic ESP32 (WROOM-32, 4 MB flash, no PSRAM), no display, controlled entirely over BLE, firmware updated over BLE with full images. Wi-Fi/web UI is out of scope for now (see [Later](#later)).
 
-The original ESP32 is dual-core (240 MHz Xtensa LX6), so the existing Core 0 (sampling + grind control) / Core 1 (BLE, file I/O) task split carries over unchanged.
+The control core (HX711, grind state machine, predictive flow, pulse correction, diagnostics, BLE, preferences) is plain Arduino/FreeRTOS code and has no hard S3 dependency. The original ESP32 is dual-core (240 MHz), so the existing Core 0 (sampling + grind control) / Core 1 (BLE, file I/O, event pump) split carries over unchanged.
 
-## What changes
+## 1. Code structure: interfaces with null implementations
 
-| Area | ESP32-S3 (today) | Regular ESP32 |
+Instead of `#ifdef` sprinkled through the code, each UI/board-specific seam gets a small interface. The S3 build wires the real implementation, the headless build wires a no-op (or BLE) one. The only per-target code is a tiny composition root (`platform_s3.cpp` / `platform_esp32.cpp`) selected by `build_src_filter` per PlatformIO env; `src/ui/`, `src/font/`, `display_manager`, `touch_driver` and the LVGL/GFX deps are simply not compiled in the headless env.
+
+| Seam | Today | Interface | Headless impl |
+|---|---|---|---|
+| Display + touch | `DisplayManager` owned by `HardwareManager`; `ota_handler` reaches into `get_display()->get_touch_driver()` | `IDisplay` (`init`, `update`, `suspend_input`) | `NullDisplay` |
+| User interface | `UIManager` referenced by `main.cpp`, `TaskManager`, OTA status callback | `IUserInterface` (`init`, `update`, `show_ota_status`, `show_ota_failure`) | `NullUserInterface` |
+| Grind events | `GrindController` already emits `GrindEventData` through a callback + Core 0→1 queue | `IGrindEventSink` | `BleEventSink` (see [feedback channel](#4-ble-feedback-channel)) |
+| Grind logging | global `grind_logger` called from `GrindController`, tasks, BLE | `IGrindLogSink` | `NullLogSink` / `BleLogSink` (see [Memory](#7-memory-and-the-logger)) |
+| Firmware writer | `OTAHandler` writes to a `patch` partition and applies a delta | `IFirmwareWriter` | `FullImageWriter` (direct to inactive OTA slot) |
+
+Three things currently live *inside* `UIManager` and must move out so headless keeps them:
+
+1. **Auto actions** (start on cup / return on removal): `UIManager::update_auto_actions()` → new UI-independent `AutomationController`.
+2. **Diagnostics**: `DiagnosticsController` is owned by `UIManager` → create it in the composition root and feed warnings to the BLE event sink.
+3. **Command handling**: the UI controllers translate touches into `GrindController`/`WeightSensor`/`Preferences` calls and `StateMachine` transitions. A new `GrinderService` facade (set target/mode, start/stop, acknowledge, tare, calibrate, purge confirm, extra pulse, settings) takes over; the BLE command characteristic calls only this facade, so a Wi-Fi API can reuse it later.
+
+Notes:
+- Keep the Core 1 "UI task" as a generic **event pump**: it is the thread that drains `GrindController::process_queued_ui_events()`, which is what feeds the `IGrindEventSink`. With `NullUserInterface` it still has to run.
+- `StateMachine`/`UIState` are plain enums with no LVGL dependency and can stay as the shared app state.
+- `config/theme.h` has no LVGL includes, so `constants.h` needs no changes.
+- This is not a large refactor: five thin interfaces, one extraction (automation), one new facade.
+
+## 2. Motor output: RMT on the classic ESP32
+
+`Grinder` drives the relay through the IDF 5 RMT TX driver (`driver/rmt_tx.h`).
+
+- **Available:** yes. Classic ESP32 has 8 RMT channels, each TX-capable with a 64-symbol memory block (S3 has only 4 TX). TX is routed through the GPIO matrix, so any **output-capable** GPIO works. Avoid 34–39 (input only), 6–11 (flash) and strapping pins 0/2/5/12/15. Suggested motor pin: **GPIO 26**. `RMT_CLK_SRC_DEFAULT` (APB, 80 MHz) at 1 MHz resolution is a valid divider; no config change.
+- **Gotcha 1 (breaks pulses):** the classic ESP32 lacks `SOC_RMT_SUPPORT_TX_LOOP_COUNT`, so `rmt_transmit()` with a *finite* `loop_count > 0` returns `ESP_ERR_NOT_SUPPORTED` (the S3 supports it). `Grinder::start_pulse_rmt()` uses `loop_count` for pulses longer than 32.767 ms and ignores the return value, so those pulses would silently not fire. Infinite loop (`-1`, used for continuous grinding) is still supported.
+  **Fix (works on both chips, no ifdef):** encode the pulse as N symbols instead of looping. A symbol holds up to 2 × 32767 µs, so even the longest pulse (latency + 250 ms) needs only a handful of symbols, far below the 64-symbol block. Also check the `rmt_transmit` return value.
+- **Gotcha 2:** `is_pulse_complete()` polls `digitalRead(motor_pin)` on an RMT-driven pin. The RMT driver only enables the *output* path, so whether the readback is reliable depends on the pad's input buffer. Prefer `rmt_tx_register_event_callbacks()` (`on_trans_done`) to flag completion; it is chip-independent. Verify on hardware either way.
+- Keep the relay input defaulting to off at reset (pull-down), and avoid pins that glitch during boot.
+
+## 3. Pins (classic ESP32 starting point)
+
+| Signal | GPIO | Note |
 |---|---|---|
-| Display / touch / LVGL | AMOLED + FT3168 | **Remove** (`display_manager`, `touch_driver`, `src/ui/`, `src/font/`, LVGL + GFX deps) |
-| User input | Touchscreen | BLE and/or Wi-Fi web UI, optional physical start button |
-| PSRAM | 8 MB OPI | None on WROOM-32 → see [Memory](#memory) |
-| Flash | 16 MB, delta-OTA partitions | Typically 4 MB → new partition table, see [Flash & OTA](#flash--ota) |
-| Console | USB-CDC (`ARDUINO_USB_CDC_ON_BOOT`) | UART via USB-serial chip; drop that flag |
-| GPIOs | `hardware.h` pins (2, 3, 18, …) | Re-map, see [Pins](#pins) |
+| HX711 DOUT | 32 | any input-capable pin |
+| HX711 SCK | 33 | output |
+| Motor relay (RMT) | 26 | output, not a strapping pin |
+| Start button (optional) | 27 | with pull-up |
+| Status LED (optional) | 2 or 25 | |
 
-## Proposed approach
+Board pins move into a board config header chosen by the env's build flag (the one place a preprocessor switch is acceptable). Drop `-DARDUINO_USB_CDC_ON_BOOT=1` and `-DBOARD_HAS_PSRAM`; the console is UART via the board's USB-serial chip.
 
-1. **New PlatformIO env** `esp32-headless` (`board = esp32dev`, `-DHEADLESS_BUILD`, no LVGL/GFX/`BOARD_HAS_PSRAM`, own partition CSV).
-2. **Compile out the UI** behind `HEADLESS_BUILD`: `main.cpp`, `task_manager.cpp` (UI render task) and `hardware_manager` are the only non-UI files referencing `UIManager`/`DisplayManager`.
-3. **Replace UI-originated events** with a small command interface that feeds the same `StateMachine`/`GrindController` entry points the UI uses today:
-   - set mode (weight/time), target weight/time, purge/prime settings
-   - start / stop grind, acknowledge timeout/completion
-   - tare, calibrate (known-weight value), motor test
-4. **Expose the interface** (pick one or both):
-   - **BLE (recommended first step)**: add one writable "grinder control" characteristic + a notify characteristic for live weight/state next to the existing OTA/data/sysinfo services. No extra radio load, works with the existing `tools/grinder.py`, and a Web Bluetooth page or phone app can drive it.
-   - **Wi-Fi web UI**: small embedded page (target grams, start/stop, live weight via WebSocket/SSE) served from the ESP32 in AP or STA mode. Nicer UX, but Wi-Fi + BLE share one radio on the ESP32 — keep BLE auto-disable (already present) or disable BLE while Wi-Fi is active.
-5. **Optional hardware inputs**: one button (start/stop) and/or a status LED. The existing *Start on Cup* automation already allows touch-free operation.
-6. **Persist** the new settings through the existing `Preferences` keys (`grind_mode`, `chute_mode`, `chute_amount_g`, target weight/time); no storage changes needed.
+## 4. BLE feedback channel
 
-## Mobile App: Web Bluetooth SPA
+Without a screen, the BLE link *is* the UI. One new **Grinder service** (128-bit UUIDs in the existing style, defined in `config/bluetooth.h`), next to the existing OTA/data/debug/sysinfo services:
 
-A static single-page app using the [Web Bluetooth API](https://developer.mozilla.org/docs/Web/API/Web_Bluetooth_API) can talk to the ESP32 directly over the BLE control/notify characteristics above. No backend, no app store.
+| Characteristic | Props | Content |
+|---|---|---|
+| `Command` | write (with response) | `[seq][opcode][payload]`: set target weight/time, set mode, start, stop, acknowledge (complete/timeout), tare, confirm purge (+keep-purge flag), extra pulse (time mode), calibrate begin/zero/known-weight, motor test, get/set setting (chute mode/amount, auto start/return, latency, …) |
+| `Status` | notify | Packed struct from `GrindEventData`: protocol version, app state, grind phase, weight, target, progress %, flow rate, pulse count, motor on, cup present, warning bitmap, event counter. ~10 Hz while grinding, ~1 Hz idle, immediately on state change. Also readable, so a client can sync after (re)connect. |
+| `Event` | indicate | Must-deliver discrete events: grind completed (final weight, result, pulses, duration), timeout (reason code), purge confirmation needed, extra pulse available, diagnostic raised/cleared, calibration step result, **command ACK/NACK** (echoing `seq` + error code). Carries a monotonically increasing event id; the last event stays readable for resync. |
+| `Telemetry` (optional) | notify | Batched `GrindMeasurement`/`GrindEvent` structs (see [Memory](#7-memory-and-the-logger)), only while a client is subscribed. |
 
-- **Hosting**: any static HTTPS host (e.g. GitHub Pages) — Web Bluetooth requires a secure context. Add a manifest + service worker to make it an installable, offline-capable PWA.
-- **UI**: target grams, mode, start/stop, tare, live weight and state, calibration wizard, warnings from diagnostics. Plain TypeScript or a light framework (Svelte/Preact) is plenty.
-- **Platform support**: Chrome/Edge on Android, Windows, macOS, Linux and ChromeOS work out of the box. **iOS Safari does not support Web Bluetooth**; use a Web Bluetooth-capable browser such as Bluefy, or wrap the same SPA with [Capacitor](https://capacitorjs.com/) + `@capacitor-community/bluetooth-le` for a native iOS/Android build.
-- **Protocol hygiene**: reuse the existing service-UUID layout, keep payloads small (JSON or a packed struct) and notification rate modest (~10 Hz matches the HX711), and version the protocol via a characteristic so the SPA can detect firmware mismatches.
-- **Bonus**: the existing OTA characteristics could later allow firmware updates from the same app.
+Design points:
+- ATT-level write response only says "received"; semantic success/failure arrives on `Event` with the command `seq`.
+- `BleEventSink` implements `IGrindEventSink` and does the struct packing on Core 1, never on the Core 0 control loop.
+- The existing Nordic UART debug service stays for text logs.
+- Headless has no way to re-enable BLE: make the auto-disable timeouts (`BLE_AUTO_DISABLE_TIMEOUT_MS`, bootup timeout) a policy that is `AlwaysOn` in this build, and restart advertising on disconnect.
+- Optional local feedback (LED/buzzer) can be another `IFeedback` null-object later; not needed for BLE-only.
 
-## Memory
+## 5. Firmware update over BLE (full image)
 
-- The grind logger allocates its staging buffers with `MALLOC_CAP_SPIRAM` (`grind_logging.cpp`). Without PSRAM that allocation fails → fall back to `MALLOC_CAP_8BIT`.
-- Size at current settings: `60 s × 50 Hz × 24 B ≈ 72 KB` of measurements (+ ~2 KB events). Too much next to the BLE/Wi-Fi stacks in ~320 KB of usable DRAM. Mitigation: raise `SYS_LOG_EVERY_N_GRIND_LOOPS` to 5 (≈ 15 KB) and/or use `GRIND_TIMEOUT_SEC` 30.
-- Dropping LVGL and the display framebuffer frees far more than the logger needs, so the net heap budget is comfortable.
-- Prefer NimBLE over the Arduino Bluedroid `BLEDevice` stack to save ~50–80 KB if heap gets tight.
+ElegantOTA is HTTP over Wi-Fi, so it does not apply. The BLE equivalent is already in the repo: the OTA GATT service (START/DATA/END/ABORT + status + build-number) and a Web Bluetooth flasher (`tools/web-flasher`). Only the sink changes:
 
-## Flash & OTA
+- `FullImageWriter` (`IFirmwareWriter`) streams chunks straight into the inactive OTA slot with `esp_ota_begin/write/end` + `esp_ota_set_boot_partition` (or the Arduino `Update` class). No `patch` partition, no delta/detools.
+- Optional: `esp32-flashz` (already a dependency) streams a zlib-compressed image into the OTA slot, roughly halving transfer time.
+- `esp_ota_end` validates the image before the boot partition is switched, so a corrupt transfer leaves the running slot untouched. Keep the existing build-number/version check after reboot.
+- Expect transfer on the order of tens of KB/s with a negotiated large MTU and write-without-response, i.e. about a minute for a ~1 MB image. Keep the existing "suspend Core 0 tasks during OTA" behavior.
+- OTA is therefore **possible over Bluetooth only**; nothing needs to be dropped. First flash is via UART. Verify the headless image stays under the 1.9 MB slot (it will be far smaller than the LVGL build).
+- Rollback: whether the Arduino prebuilt bootloader has app rollback enabled needs to be checked; without it there is no automatic fallback to the previous slot for an image that boots but misbehaves.
 
-- `partitions.csv` assumes 16 MB (factory + 2 OTA slots at 3 MB + 2 MB patch). A 4 MB ESP32 needs e.g. the stock `min_spiffs` layout (2 × ~1.9 MB OTA + small LittleFS).
-- Delta-OTA needs a patch partition and a factory slot, so it does **not** fit in 4 MB. Use plain (compressed) BLE OTA there, or buy a 8/16 MB module to keep delta OTA.
-- Headless firmware is much smaller than the LVGL build, so full-image OTA is realistic.
+## 6. Flash layout (4 MB, no factory/patch partition)
 
-## Pins
+Replace `partitions.csv` for this env with the standard dual-OTA layout:
 
-Avoid on a classic ESP32: GPIO 6–11 (flash), 34–39 (input-only, fine for HX711 DOUT but not outputs), and be careful with strapping pins 0, 2, 5, 12, 15 for the relay (must not be driven at boot).
+```csv
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000
+otadata,  data, ota,     0xE000,   0x2000
+app0,     app,  ota_0,   0x10000,  0x1E0000
+app1,     app,  ota_1,   0x1F0000, 0x1E0000
+spiffs,   data, spiffs,  0x3D0000, 0x30000
+```
 
-Suggested starting point:
+~1.9 MB per app slot, ~192 KB LittleFS (autotune log and, if enabled, session files). Remove `components/delta` and `components/detools` from this env's `lib_extra_dirs`.
 
-| Signal | GPIO |
-|---|---|
-| HX711 DOUT | 32 |
-| HX711 SCK | 33 |
-| Motor relay | 26 |
-| Start button (optional) | 27 |
+## 7. Memory and the logger
 
-Put these in a board-specific section of `src/config/hardware.h` selected via the env flag.
+Logger buffers are the only PSRAM consumer: `60 s × 50 Hz × 24 B ≈ 72 KB` of measurements plus ~2 KB events, allocated with `MALLOC_CAP_SPIRAM`. On a no-PSRAM ESP32 that allocation returns null; `GrindLogger::init()` then fails, `GrindController` already logs "grind logging disabled" and continues, and `logging_active` stays false. So the logger is *already* effectively a no-op there, but by accident (a failed malloc) and the BLE data-export/sysinfo paths still reference it. Options, behind `IGrindLogSink`:
 
-## Risks / things to verify
+| Option | RAM | Pros | Cons |
+|---|---|---|---|
+| A. **Null sink** | 0 | Simplest, explicit, nothing to tune. Dropping LVGL/display frees far more heap than the logger ever used. | No on-device grind history, data export/analysis tooling has nothing to read. |
+| B. **BLE stream** (`BleLogSink`) | ~1–2 KB batch buffer | Same packed `GrindMeasurement`/`GrindEvent` structs (schema v2), batched into notifications (50 Hz × 24 B ≈ 1.2 KB/s, fits easily). The phone/SPA stores sessions (IndexedDB) and can export the existing binary format, so `tools/grinder.py analyze` keeps working. No flash wear, unlimited history. | Needs a connected, subscribed client during the grind; samples are lost otherwise. Notification backpressure must never block Core 0 (drop-oldest queue). |
+| C. **Stream to LittleFS** | ~2 KB chunk | Offline logging, reuses the existing session files and export. | Flash wear and write latency on Core 1, only ~190 KB of storage (~10 sessions), more code. |
+| D. **Shrink the RAM buffer** | ~15 KB | One-line change (`SYS_LOG_EVERY_N_GRIND_LOOPS` 5; HX711 delivers 10 SPS, so most 50 Hz samples are repeats). | Keeps 15 KB resident next to the BLE stack for a feature nobody sees without a screen. |
 
-- **HX711 timing**: bit-banged clock must stay glitch-free under Wi-Fi/BLE load → keep sampling pinned to Core 0 and run the radio stacks on Core 1 (already the layout).
-- **Relay safety at boot/reset**: ensure the relay pin defaults LOW with a pull-down.
-- **Wi-Fi + BLE coexistence** if both are enabled.
-- **No on-device feedback** for errors (timeout, calibration, noise warnings) → surface them over BLE/web and with an LED/buzzer.
-- **Calibration** must be possible without a screen (BLE command with known weight).
+**Recommendation:** ship **A** first (explicit null sink), add **B** right after the Status/Event channel works. It is the natural fit for a BLE-only device, and C/D can come later if offline logging is wanted. Dropping the data-export service from this build is optional; it simply reports zero sessions.
 
-## Effort estimate
+Other heap notes: Arduino's Bluedroid-based `BLEDevice` is the heaviest part of the remaining budget (NimBLE would save roughly 50–80 KB but means porting the 1.8k-line `manager.cpp`); BLE-only mode releases the classic BT memory.
 
-Small-to-moderate: a build env, an `#ifdef` pass over the UI references, a command/notify characteristic (or web page), pin remap, partition table, and the logger PSRAM fallback. No changes to the grind algorithms.
+## Later
+
+- **Wi-Fi + web UI** (served from the ESP32): reuse `GrinderService` and `IGrindEventSink` as a second front end. Wi-Fi and BLE share one radio on the classic ESP32, so this needs a "BLE or Wi-Fi" policy.
+- **Phone app:** extend the existing Web Bluetooth page (`tools/web-flasher`) into a controller SPA/PWA (Chrome/Edge on Android and desktop; iOS needs a Web Bluetooth browser such as Bluefy or a Capacitor wrapper). It consumes `Command`/`Status`/`Event` and handles OTA and session storage.
+- **Local feedback:** LED/buzzer behind an `IFeedback` null-object.
+
+## Checklist to verify on hardware
+
+- Pulse timing and completion detection with the RMT multi-symbol fix; infinite-loop continuous mode on the classic ESP32.
+- Relay stays off through reset/boot on the chosen pin.
+- HX711 sampling stays glitch-free with BLE active (sampling pinned to Core 0, BLE on Core 1).
+- Image size vs. 1.9 MB slot; free heap with BLE connected and notifying.
+- BLE OTA throughput and rollback behavior.
