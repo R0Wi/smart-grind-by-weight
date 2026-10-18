@@ -287,13 +287,10 @@ void WeightSensor::calibrate(float known_weight) {
     
     LOG_CALIBRATION_DEBUG("Weight settled, performing calibration...");
     
-    // Now perform calibration with high accuracy - CircularBufferMath handles all filtering
-    
-    unsigned long cal_start = millis();
-    while(!update_async() && millis() - cal_start < GRIND_CALIBRATION_TIMEOUT_MS) {
-        delay(10);
-    }
-    
+    // Now perform calibration with high accuracy - CircularBufferMath handles all filtering.
+    // Samples are fed exclusively by WeightSamplingTask on Core 0; this runs on the UI core,
+    // so it must not clock the HX711 itself (concurrent bit-banging corrupts conversions).
+
     // Calibration using raw ADC data - more precise than calibrated data
     int32_t raw_reading = raw_filter.get_raw_high_latency(); // Use high-latency for precision
     

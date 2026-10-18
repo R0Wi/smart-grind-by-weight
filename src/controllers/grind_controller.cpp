@@ -10,10 +10,6 @@
 #include <cmath>
 #include <algorithm>
 
-#if defined(DEBUG_ENABLE_LOADCELL_MOCK) && (DEBUG_ENABLE_LOADCELL_MOCK != 0)
-#include "../hardware/mock_hx711_driver.h"
-#endif
-
 // UI event queue size
 #define UI_EVENT_QUEUE_SIZE 10
 
@@ -21,6 +17,28 @@
 #define FLASH_OP_QUEUE_SIZE 5
 
 static constexpr float NO_WEIGHT_DELIVERED_THRESHOLD_G = 0.2f;
+
+namespace {
+// RAII guard for the controller's recursive mutex (no-op if the mutex was not created)
+class ControlLock {
+public:
+    explicit ControlLock(SemaphoreHandle_t mutex) : mutex_(mutex) {
+        if (mutex_) {
+            xSemaphoreTakeRecursive(mutex_, portMAX_DELAY);
+        }
+    }
+    ~ControlLock() {
+        if (mutex_) {
+            xSemaphoreGiveRecursive(mutex_);
+        }
+    }
+    ControlLock(const ControlLock&) = delete;
+    ControlLock& operator=(const ControlLock&) = delete;
+
+private:
+    SemaphoreHandle_t mutex_;
+};
+}  // namespace
 
 void GrindController::init(WeightSensor* lc, Grinder* gr, Preferences* prefs) {
     weight_sensor = lc;
@@ -46,10 +64,7 @@ void GrindController::init(WeightSensor* lc, Grinder* gr, Preferences* prefs) {
 
     // Initialize grind freshness tracking
     grinder_purged_since_boot = false;
-    last_purge_runtime_ms = 0;
-    if (preferences) {
-        last_purge_runtime_ms = preferences->getULong64(PREF_KEY_LAST_GRIND_RUNTIME, 0);
-    }
+    last_purge_runtime_ms = 0;  // Uptime-based, only meaningful within the current boot
 
     // Set up grinder background indicator callback (if enabled)
     if (grinder) {
@@ -77,6 +92,13 @@ void GrindController::init(WeightSensor* lc, Grinder* gr, Preferences* prefs) {
     ui_event_callback = nullptr;
     ui_ready_for_setup = false;
     
+    if (!control_mutex_) {
+        control_mutex_ = xSemaphoreCreateRecursiveMutex();
+        if (!control_mutex_) {
+            LOG_BLE("ERROR: Failed to create grind control mutex\n");
+        }
+    }
+
     // Initialize thread-safe UI event queue
     ui_event_queue = xQueueCreate(UI_EVENT_QUEUE_SIZE, sizeof(GrindEventData));
     if (!ui_event_queue) {
@@ -109,6 +131,7 @@ void GrindController::init(WeightSensor* lc, Grinder* gr, Preferences* prefs) {
 }
 
 void GrindController::start_grind(float target, uint32_t time_ms, GrindMode grind_mode) {
+    ControlLock lock(control_mutex_);
     LOG_BLE("[%lums CONTROLLER] start_grind() called with target=%.1fg, time=%lums, mode=%s\n",
             millis(), target, (unsigned long)time_ms, grind_mode == GrindMode::TIME ? "TIME" : "WEIGHT");
     if (!weight_sensor || !grinder) return;
@@ -215,6 +238,7 @@ void GrindController::user_tare_request() {
 }
 
 void GrindController::return_to_idle() {
+    ControlLock lock(control_mutex_);
     // This is called by the UI to acknowledge a completed or timed-out grind
     // and return the controller to the IDLE state.
     if (phase == GrindPhase::COMPLETED || phase == GrindPhase::TIMEOUT) {
@@ -234,6 +258,7 @@ void GrindController::return_to_idle() {
 }
 
 void GrindController::stop_grind() {
+    ControlLock lock(control_mutex_);
     if (!grinder) return;
     
     grinder->stop();
@@ -256,6 +281,7 @@ void GrindController::stop_grind() {
 }
 
 void GrindController::continue_from_purge() {
+    ControlLock lock(control_mutex_);
     // Called by UI when user confirms purge completion
     if (phase != GrindPhase::PURGE_CONFIRM) {
         LOG_BLE("[%lums CONTROLLER] Warning: continue_from_purge() called in wrong phase: %s\n",
@@ -283,6 +309,7 @@ void GrindController::continue_from_purge() {
 }
 
 void GrindController::update() {
+    ControlLock lock(control_mutex_);
     if (!is_active()) return;
     
     unsigned long now = millis();
@@ -348,8 +375,13 @@ void GrindController::update() {
         case GrindPhase::TARE_CONFIRM:
             // Check if tare is complete
             if (!weight_sensor->is_tare_in_progress()) {
-                // Double confirm weights are settled
-                if (weight_sensor->is_settled()) {
+                // The tare offset was just sampled; it is only trustworthy if the scale was
+                // settled while it was taken. Otherwise re-tare instead of grinding against
+                // a zero point captured mid-disturbance (e.g. cup still wobbling).
+                if (!weight_sensor->is_settled()) {
+                    LOG_LOADCELL_DEBUG("Tare captured while unsettled - re-taring\n");
+                    weight_sensor->start_nonblocking_tare();
+                } else {
                     if (!grinder->is_grinding()) {
                         grinder->start();  // Ensure motor is running
                     }
@@ -469,16 +501,30 @@ void GrindController::update() {
             }
             break;
             
-        case GrindPhase::TIME_ADDITIONAL_PULSE:
-            // Check for additional pulse completion
-            if (grinder && grinder->is_pulse_complete()) {
-                LOG_BLE("[%lums CONTROLLER] Additional pulse #%d completed, weight: %.2fg\n", 
-                        millis(), additional_pulse_count, weight_sensor ? weight_sensor->get_display_weight() : 0.0f);
-                
+        case GrindPhase::TIME_ADDITIONAL_PULSE: {
+            // Wait for the pulse to finish, give the grounds time to land and the scale to
+            // settle, then refresh final_weight so the completion screen shows the new total.
+            if (!grinder || !grinder->is_pulse_complete()) {
+                break;
+            }
+            unsigned long elapsed_ms = loop_data.now - phase_start_time;
+            if (elapsed_ms < pulse_duration_ms + GRIND_TIME_PULSE_COLLECTION_DELAY_MS) {
+                break;
+            }
+            bool settled = weight_sensor->check_settling_complete(GRIND_SCALE_PRECISION_SETTLING_TIME_MS);
+            bool settling_timed_out = elapsed_ms >= GRIND_SCALE_SETTLING_TIMEOUT_MS;
+            if (settled || settling_timed_out) {
+                // A pulse can only add grounds; a lower reading means the cup was lifted or
+                // disturbed, so keep the previous result rather than reporting it.
+                final_weight = std::max(final_weight, weight_sensor->get_weight_high_latency());
+                LOG_BLE("[%lums CONTROLLER] Additional pulse #%d completed, weight: %.2fg\n",
+                        millis(), additional_pulse_count, final_weight);
+
                 // Return to completed phase
                 switch_phase(GrindPhase::COMPLETED, loop_data);
             }
             break;
+        }
             
         case GrindPhase::COMPLETED:
             if (grind_logger.is_logging_active() && !session_end_flash_queued) {
@@ -549,11 +595,14 @@ void GrindController::update() {
     emit_progress_update(loop_data);
 
     // Check for negative weight failsafe after TARE_CONFIRM phase during active grinding
-    // Only check after motor has settled to avoid false positives from startup transients
+    // Only check after motor has settled to avoid false positives from startup transients.
+    // Once a time-mode additional pulse has finished the grind is already complete, so
+    // lifting the cup while its weight is re-measured must not be reported as an error.
+    bool post_pulse_measurement = (phase == GrindPhase::TIME_ADDITIONAL_PULSE) && !grinder->is_grinding();
     if (phase != GrindPhase::COMPLETED && phase != GrindPhase::TIMEOUT &&
         phase != GrindPhase::IDLE && phase != GrindPhase::INITIALIZING &&
         phase != GrindPhase::SETUP && phase != GrindPhase::TARING &&
-        phase != GrindPhase::TARE_CONFIRM &&
+        phase != GrindPhase::TARE_CONFIRM && !post_pulse_measurement &&
         grinder->is_motor_settled() &&
         loop_data.current_weight < -1.0f) {
         timeout_phase = phase;
@@ -757,12 +806,11 @@ void GrindController::switch_phase(GrindPhase new_phase, const GrindLoopData& lo
         }
         last_session_result_ = session_result;
 
-        // Update grind freshness tracking
+        // Update grind freshness tracking (RAM only: the timestamp is uptime-based and is
+        // never consulted before the first grind of a boot, so persisting it would only
+        // add a blocking NVS write to the Core 0 control loop)
         grinder_purged_since_boot = true;
         last_purge_runtime_ms = esp_timer_get_time() / 1000;
-        if (preferences) {
-            preferences->putULong64(PREF_KEY_LAST_GRIND_RUNTIME, last_purge_runtime_ms);
-        }
 
         event_data.event = UIGrindEvent::COMPLETED;
         // Use final_weight if available (from final_measurement), otherwise use high latency weight
@@ -872,6 +920,7 @@ void GrindController::set_ui_event_callback(void (*callback)(const GrindEventDat
 }
 
 void GrindController::ui_acknowledge_phase_transition() {
+    ControlLock lock(control_mutex_);
     if (phase == GrindPhase::INITIALIZING) {
         ui_ready_for_setup = true;
         LOG_UI_DEBUG("UI acknowledged INITIALIZING phase transition\n");
@@ -1039,6 +1088,7 @@ void GrindController::set_error_message(const char* message) {
 }
 
 void GrindController::start_additional_pulse() {
+    ControlLock lock(control_mutex_);
     if (!can_pulse()) {
         return;
     }
@@ -1064,13 +1114,8 @@ void GrindController::start_additional_pulse() {
     empty_loop_data.now = millis();
     switch_phase(GrindPhase::TIME_ADDITIONAL_PULSE, empty_loop_data);
 
-    // Start the pulse
+    // Start the pulse (Grinder also forwards it to the mock driver when mocking)
     grinder->start_pulse_rmt(pulse_duration_ms);
-    
-    // Notify mock driver for weight simulation (if mock is active)
-#if defined(DEBUG_ENABLE_LOADCELL_MOCK) && (DEBUG_ENABLE_LOADCELL_MOCK != 0)
-    MockHX711Driver::notify_pulse(pulse_duration_ms);
-#endif
 }
 
 bool GrindController::can_pulse() const {

@@ -12,6 +12,7 @@
 #include <LittleFS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 class DiagnosticsController;
 
@@ -138,6 +139,11 @@ private:
 
     // UI event system - thread-safe Core 0 → Core 1 communication
     QueueHandle_t ui_event_queue;
+
+    // Serializes the Core 0 control loop (update()) against UI-initiated state changes
+    // (start/stop/continue/pulse) issued from Core 1, so both never drive the motor or
+    // the phase machine at the same time.
+    SemaphoreHandle_t control_mutex_ = nullptr;
     
     bool control_loop_paused_;      // Indicates control loop is suspended (e.g., purge confirmation)
     
@@ -179,7 +185,7 @@ private:
 
     // Grind freshness tracking
     bool grinder_purged_since_boot;      // Tracks if grinder has been used since boot (RAM only)
-    uint64_t last_purge_runtime_ms;      // Runtime when last grind completed (persisted)
+    uint64_t last_purge_runtime_ms;      // Uptime when last grind completed (RAM only)
 
 public:
     enum class GrindSessionResult {
@@ -231,7 +237,6 @@ public:
     static constexpr const char* PREF_KEY_GRINDER_MODE = "grinder_mode";
     static constexpr const char* PREF_KEY_GRINDER_AMOUNT_G = "grinder_amount_g";
     static constexpr const char* PREF_KEY_GRIND_FRESHNESS_HOURS = "freshness_hrs";
-    static constexpr const char* PREF_KEY_LAST_GRIND_RUNTIME = "last_grind_ms";
     GrindMode get_mode() const { return mode; }
     const GrindSessionDescriptor& get_session_descriptor() const { return session_descriptor; }
     

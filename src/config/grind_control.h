@@ -54,6 +54,7 @@ enum class GrinderPurgeMode {
 // TIME MODE PULSE SETTINGS
 //------------------------------------------------------------------------------
 #define GRIND_TIME_PULSE_DURATION_MS 100                                        // Duration of additional pulses in time mode (milliseconds)
+#define GRIND_TIME_PULSE_COLLECTION_DELAY_MS 1000                               // Minimum wait after an additional pulse before re-measuring (grounds still in flight)
 
 
 

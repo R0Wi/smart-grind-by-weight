@@ -534,7 +534,7 @@ The system uses a **zero-shot learning algorithm** requiring no prior knowledge 
 **Multi-Phase Approach:**
 
 1. **Initialization & Taring Phase**
-   - Automatic tare on grind button press
+   - Automatic tare on grind button press (re-tares automatically if the scale was not settled while the zero point was captured)
    - 30-second timeout from grind start to completion
    - Noise-adaptive settling detection
 
@@ -561,6 +561,7 @@ The system uses a **zero-shot learning algorithm** requiring no prior knowledge 
 5. **Time Mode Additional Pulses**
    - Dedicated `TIME_ADDITIONAL_PULSE` phase for post-completion grinding
    - 100ms fixed pulse duration
+   - After each pulse the scale is allowed to collect and settle before the displayed final weight is refreshed
    - Split-button UI: OK + PULSE buttons on completion screen
 
 **Motor Response Latency Model:**
